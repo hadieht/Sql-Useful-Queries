@@ -1,0 +1,19 @@
+USE Master
+Go
+
+DECLARE @DatabaseName SYSNAME
+DECLARE @SystemProcessesID INT
+SET @DatabaseName = 'DBName'
+
+SELECT  @SystemProcessesID = MIN(spid)
+FROM    master.dbo.sysprocesses
+WHERE   dbid = DB_ID(@DatabaseName)
+	
+WHILE @SystemProcessesID IS NOT NULL 
+    BEGIN
+        EXECUTE ('Kill ' + @SystemProcessesID)
+        SELECT  @SystemProcessesID = MIN(spid)
+        FROM    master.dbo.sysprocesses
+        WHERE   dbid = DB_ID(@DatabaseName)
+                AND spid > @SystemProcessesID
+    END
