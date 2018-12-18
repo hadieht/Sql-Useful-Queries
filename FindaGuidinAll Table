@@ -1,0 +1,209 @@
+set transaction isolation level read uncommitted
+
+/* Declare variables */
+declare @strSql nvarchar(max),
+    @searchguid uniqueidentifier,
+    @lowrow smallint,
+    @SrchEvtTables bit,
+    @SrchCharTypes bit,
+    @SrchTextTypes bit,
+    @CharTypeColName varchar(200)
+
+/* Enter Search Guid here */
+set  @searchguid = ltrim(rtrim('a663c940-70a5-4b6b-87d7-a39df0829c3e'))
+
+/* Search Event Tables: If you wish to disable searching the event tables then set
+   @SrchEvtTables to 0.  This option was added since the event tables can get quite large
+   and many of the guid columns in them are not indexed. Disabling this will speed up the
+   query in such cases (at the cost of not searching those tables).
+   (Enabled: 1, Disabled: 0) */
+set @SrchEvtTables = 1
+
+/* Search Character Type Columns: There are some columns in the database that hold GUIDs,
+   but the column is not a uniqueidentifier type (they have the GUID as a character string
+   instead).  If you want to search character column types (char, nchar, varchar, and
+   nvarchar) then you must set the @SrchCharTypes value to 1.  
+      
+   Additionally, you can use the @CharTypeColName variable to specify a string that the
+   name of the column is LIKE.  For example, if you want to search the [ProgramId] column
+   in the SWDAdvertisement table (which is a nvarchar(50)) then you would SET the
+   @CharTypeColName = 'ProgramId' (or = '%Id' if you want to search for columns named
+   'ProgramId' or 'Guid') */
+set @SrchCharTypes = 1
+set @CharTypeColName = lower('%id')
+
+/* Search text and ntext type columns: These columns are designed to hold lots that may inlcude the guid as part of it.
+   Warrning: Searching text and ntext fields will significatly slow down the search process and put extra load on SQL.
+   To search text and ntext fields for the guid then set @SrchTextTypes to 1 */
+set @SrchTextTypes = 0
+
+/* Table variable to hold all columns that have a GUID name or uniqueidentifier type.  
+Holds an ID value (for looping), the table name and  the column type as well. */
+declare @TablesToBeSearched table
+(
+    RowId smallint identity(1,1),
+    TableName varchar(255),
+    ColName varchar(128),
+    IsGuidType bit,
+    SQLQuery nvarchar(255)
+)
+
+/* Get meta data for columns and tables that are uniqueidentifiers */
+insert into @TablesToBeSearched
+select [TABLE_NAME],
+    [COLUMN_NAME],
+    [IsGuidType],
+    'from [' + [TABLE_NAME] + '] where [' + [COLUMN_NAME] + '] = ''' + cast(@searchguid as varchar(38)) + ''''
+from
+(
+    select isc.[TABLE_NAME],
+        isc.[COLUMN_NAME],
+        1 [IsGuidType],
+        case
+            when substring(isc.[TABLE_NAME], 1, 4) = 'Evt_'
+                then 1
+            else 0
+        end [IsEventTable]
+    from INFORMATION_SCHEMA.COLUMNS isc
+        inner join INFORMATION_SCHEMA.TABLES ist
+            on isc.[TABLE_NAME] = ist.[TABLE_NAME]
+    where isc.[DATA_TYPE] = 'uniqueidentifier'
+        and ist.[TABLE_TYPE] = 'BASE TABLE'
+) t1
+where [IsEventTable] = 0
+    or ([IsEventTable] = 1 and @SrchEvtTables = 1)
+
+/* If @SrchCharTypes is 1 then get meta data for character type columns as well. */
+if (@SrchCharTypes = 1)
+begin
+    insert into @TablesToBeSearched
+    select [TABLE_NAME],
+        [COLUMN_NAME],
+        [IsGuidType],
+        'from [' + [TABLE_NAME] + '] where lower([' + [COLUMN_NAME] + ']) like ''%' + lower(cast(@searchguid as varchar(38))) + '%'''  
+    from
+    (
+        select isc.[TABLE_NAME],
+            isc.[COLUMN_NAME],
+            0 [IsGuidType],
+            case
+                when substring(isc.[TABLE_NAME], 1, 4) = 'Evt_'
+                    then 1
+                else 0
+            end [IsEventTable]
+        from INFORMATION_SCHEMA.COLUMNS isc
+            join INFORMATION_SCHEMA.TABLES ist
+                on isc.[TABLE_NAME] = ist.[TABLE_NAME]
+        where isc.[DATA_TYPE] in
+        (
+            'char',
+            'nchar',
+            'varchar',
+            'nvarchar'
+        )
+            and lower(ltrim(rtrim(isc.[COLUMN_NAME]))) like ltrim(rtrim(@CharTypeColName))
+            and ist.[TABLE_TYPE] = 'BASE TABLE'
+            and isc.[CHARACTER_MAXIMUM_LENGTH] >= 38
+    ) t1
+    where [IsEventTable] = 0
+        or ( [IsEventTable] = 1 and @SrchEvtTables = 1)  
+end
+
+/*
+    If @SrchTextTypes is 1 then get meta data for text and ntext type columns.
+*/
+if @SrchTextTypes  = 1
+begin
+    insert into @TablesToBeSearched
+    select [TABLE_NAME],
+        [COLUMN_NAME],
+        [IsGuidType],
+        'from [' + [TABLE_NAME] + '] where lower(cast([' + [COLUMN_NAME] + '] as nvarchar(max))) like ''%' + CAST(@searchguid AS varchar(38)) + '%'''
+    from
+    (
+        select isc.[TABLE_NAME],
+            isc.[COLUMN_NAME],
+            null [IsGuidType],
+            case
+                when substring(isc.[TABLE_NAME], 1, 4) = 'Evt_'
+                    then 1
+                else 0
+            end [IsEventTable]
+        from INFORMATION_SCHEMA.COLUMNS isc
+            join INFORMATION_SCHEMA.TABLES ist
+                on isc.[TABLE_NAME] = ist.[TABLE_NAME]
+        where isc.[DATA_TYPE] in ('text', 'ntext')
+            and ist.[TABLE_TYPE] = 'BASE TABLE'
+    ) t1
+    where [IsEventTable] = 0
+        or ( [IsEventTable] = 1 and @SrchEvtTables = 1)
+end
+
+/*
+    Drop Temp table being used if it exists
+*/
+if (object_id('tempdb..#Found') is not null)
+    drop table #Found
+
+/*
+    Temp table that will hold # of rows where guid was found in each table
+*/
+create table #Found (RowId smallint, RowsFound int)
+
+/*
+    Search uniqueidentifier columns 15 at a time, insert counts into #Found table
+*/
+set @lowrow = 0
+
+while (@lowrow < (select max(RowId) from @TablesToBeSearched where IsGuidType is not null))
+begin
+    set @strSql = null
+
+    select @strSql = coalesce(@strSql + ' union all select ', 'insert into #Found
+        select ') + '''' + cast(ttbs.[RowId] as varchar(10)) + ''' [id], count(*) [cnt] ' + ttbs.SQLQuery
+    from @TablesToBeSearched ttbs
+    where ttbs.[RowId] between @lowrow + 1 and @lowrow + 15
+        and (IsGuidType = 1 or @SrchCharTypes = 1)
+ 
+    exec(@strSql)
+    
+    set @lowrow = @lowrow + 15
+end
+
+set @lowrow = (select max(RowId) from @TablesToBeSearched where IsGuidType is not null)
+
+/*
+    If @SrchCharTypes is 1 Search character columns as well, insert counts into #Found table
+*/
+if (@SrchTextTypes  = 1)
+begin
+    while (@lowrow < (select max(RowId) from @TablesToBeSearched where IsGuidType is null))
+    begin
+        set @strSql = null
+
+        select @strSql = coalesce(@strSql + ' union all select ', 'insert into #Found
+            select ') + '''' + cast(ttbs.[RowId] as varchar(10)) + ''' [id]
+            , count(*) [cnt] ' + ttbs.SQLQuery
+        from @TablesToBeSearched ttbs
+        where ttbs.[RowId] between @lowrow + 1 and @lowrow + 1
+            and ttbs.[IsGuidType] is null
+            
+        exec(@strSql)
+        
+        set @lowrow = @lowrow + 1
+    end
+end
+
+/*
+    Select tables, columns, and rows found where rowsfound > 0
+*/
+select distinct ttbs.[TableName],
+    ttbs.[ColName],
+    f.[RowsFound],
+    'select * ' + ttbs.SQLQuery
+from #Found f
+    join @TablesToBeSearched ttbs
+        on f.[RowId] = ttbs.[RowId]
+where RowsFound > 0
+
+drop table #Found
